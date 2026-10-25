@@ -4,9 +4,10 @@ from pathlib import Path
 import shutil
 import time
 import uuid
+from copy import deepcopy
 from .core import (ROOT, IDENTITY, clean_config, digest, executable, ffmpeg, inside,
                    load_config, read_json, resolve, run_command, transform, vector, write_json)
-from .patches import validate_patch
+from .patches import validate_patch, repair_objects
 from . import splats
 
 
@@ -16,14 +17,17 @@ def new_run(config, output):
     # Each run is immutable with respect to its input configuration.
     out.mkdir(parents=True, exist_ok=False)
     write_json(out/'config.json', clean_config(cfg))
-    write_json(out/'context.json', {'config_base':cfg['_base'], 'source_config_sha256':digest(config)})
+    write_json(out/'context.json', {'config_base':cfg['_base'], 'source_config_sha256':digest(config), 'run_config_sha256':digest(out/'config.json')})
     write_json(out/'state.json', {'version':1, 'stages':{}})
     return out
 
 
 def run_config(run):
+    context = read_json(Path(run)/'context.json')
+    if context.get('run_config_sha256') != digest(Path(run)/'config.json'):
+        raise RuntimeError('Run config changed or lacks an integrity receipt; start a new run')
     cfg = load_config(Path(run)/'config.json')
-    cfg['_base'] = read_json(Path(run)/'context.json')['config_base']
+    cfg['_base'] = context['config_base']
     return cfg
 
 
@@ -190,9 +194,28 @@ def stage_objects(run):
         spec_file = resolve(base,spec_path)
         base = spec_file.parent
         specs = validate_objects(read_json(spec_file)['objects'],base)
+    imported=[]
+    previous=cfg.get('existing_objects_package')
+    if previous:
+        previous=resolve(cfg['_base'],previous)
+        validate_package(previous)
+        imported=deepcopy(read_json(previous/'scene.json').get('objects',[]))
+    additions=repair_objects(read_json(run/'repairs'/'patch.json'), imported)
+    retained_ids={obj['id'] for obj in imported+additions}
+    if any(obj['id'] in retained_ids for obj in specs):
+        raise ValueError('New SAM object id collides with a retained or repaired object')
     dest = run/'objects'
     dest.mkdir(exist_ok=False)
     results=[]
+    for obj in imported:
+        if obj.get('asset'):
+            source=inside(previous,obj['asset'])
+            obj['asset']=str(Path('objects')/'imported'/obj['id']/source.name)
+            target=inside(run,obj['asset']);target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(source,target)
+        obj.setdefault('provenance',{})['reused_package_sha256']=digest(previous/'checksums.json')
+        results.append(obj)
+    results.extend(additions)
     for obj in specs:
         out = dest/obj['id']
         repo = Path(os.environ.get('SAM3D_REPO','')).expanduser()
@@ -234,7 +257,9 @@ def stage_package(run, output):
         room['mesh']=copy_asset(run/'repairs'/'repairs.glb',out,'assets/repairs.glb')
     objects=read_json(run/'objects'/'objects.json')['objects']
     for obj in objects:
-        obj['asset']=copy_asset(inside(run,obj['asset']),out,f"assets/objects/{obj['id']}.ply")
+        if obj.get('asset'):
+            source=inside(run,obj['asset'])
+            obj['asset']=copy_asset(source,out,f"assets/objects/{obj['id']}{source.suffix}")
     manifest={'version':1,'title':cfg.get('title','Reconstructed room'), 'world':{'up':'+Y','units':cfg.get('units','uncalibrated'),
               'metric_scale_verified':False}, 'room':room,'objects':objects,
               'camera':cfg.get('camera',{'position':[3,2,3],'target':[0,0,0]}),
@@ -253,7 +278,7 @@ def stage_package(run, output):
 def finalize_package(out):
     out=Path(out)
     if not (ROOT/'web'/'dist'/'index.html').is_file():
-        raise RuntimeError('Build viewer first: cd web && npm ci && npm run build')
+        raise RuntimeError('Prebuilt viewer is missing. Upload web/dist/ or rebuild with your existing Three.js: node web/build.mjs (no installation is performed)')
     shutil.copytree(ROOT/'web'/'dist',out,dirs_exist_ok=True)
     # checksum assets and manifest; viewer bundle is included too
     hashes={str(p.relative_to(out)):digest(p) for p in sorted(out.rglob('*')) if p.is_file() and p.name!='checksums.json'}
@@ -281,25 +306,45 @@ def validate_package(out):
     for path,representation in assets:
         p=inside(out,path)
         if not p.is_file():
-            raise ValueError(f'Missing asset {path}')
+            raise ValueError(f'Missing asset {path}. Restore demo assets or provide the configured source.')
+        from .uploads import pointer
+        if pointer(p):
+            raise ValueError(f'{path} is a Git LFS pointer, not the asset. Materialize it with your existing Git LFS setup or restore-assets.')
         if representation=='splat':
             splats.inspect(p)
         elif representation=='mesh':
             import struct
             raw=p.read_bytes()
+            if len(raw)<12:raise ValueError(f'Truncated GLB: {path}')
             magic,version,length=struct.unpack('<4sII',raw[:12])
             if magic!=b'glTF' or version!=2 or length!=len(raw):
                 raise ValueError(f'Invalid GLB: {path}')
-    for relative,sha in read_json(out/'checksums.json').items():
+    hashes = read_json(out/'checksums.json')
+    if not isinstance(hashes, dict):
+        raise ValueError('checksums.json must be a file-to-SHA256 object')
+    required_hashes = {'scene.json', *(path for path, _ in assets)}
+    if manifest.get('camera_views'):
+        required_hashes.add(manifest['camera_views'])
+    # A present browser bundle must be covered too; tiny data-only fixtures remain valid.
+    required_hashes.update(str(p.relative_to(out)) for p in out.rglob('*')
+                           if p.is_file() and p.suffix in ('.js', '.html', '.css'))
+    missing_hashes = required_hashes - hashes.keys()
+    if missing_hashes:
+        raise ValueError('Missing checksums for: ' + ', '.join(sorted(missing_hashes)))
+    for relative,sha in hashes.items():
         p=inside(out,relative)
         if not p.is_file() or digest(p)!=sha:
             raise ValueError(f'Checksum mismatch: {relative}')
-    return {'status':'passed','assets':len(assets),'files':len(read_json(out/'checksums.json'))}
+    return {'status':'passed','assets':len(assets),'files':len(hashes)}
 
 
 def package_demo(name, output):
     src=ROOT/'demo'/name
     manifest=read_json(src/'scene.json')
+    from .uploads import pointer
+    asset=inside(src,manifest['room']['asset'])
+    if not asset.is_file() or pointer(asset):
+        raise ValueError(f'Demo asset missing or stored as an LFS pointer: {asset.relative_to(ROOT)}. Run check-repo and restore-assets before packaging.')
     out=Path(output).resolve()
     out.mkdir(parents=True,exist_ok=False)
     shutil.copytree(src,out,dirs_exist_ok=True)
